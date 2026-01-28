@@ -44,6 +44,9 @@ pub use error::{Error, Result};
 pub use llm::{
     query as llm_query, query_structured, query_with_config, query_with_model, Agent, AgentBuilder,
     LlmBackend, LlmConfig,
+    // Chat types for native tool calling
+    chat_with_tools, chat_with_tools_and_model, ChatMessage, ChatResponse, ChatRole,
+    ChatToolDefinition, FunctionCall, FunctionDef, ToolCall,
 };
 pub use prompt::PromptManager;
 pub use rig::completion::request::ToolDefinition;

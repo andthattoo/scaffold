@@ -8,8 +8,8 @@
 //!
 //! # Usage
 //!
-//! Enable tracing with `SCAFFOLD_TRACE=1` or `--trace` flag.
-//! Traces are emitted as JSONL to stderr or a file.
+//! Enable tracing by setting `SCAFFOLD_TRACE_FILE=/path/to/traces.jsonl`.
+//! Traces are emitted as JSONL to the specified file.
 //!
 //! ```ignore
 //! use scaffold_runtime::trace::{Tracer, TraceEvent};
@@ -50,9 +50,14 @@ pub struct TracerConfig {
 
 impl Default for TracerConfig {
     fn default() -> Self {
+        // SCAFFOLD_TRACE_FILE=/path/to/file.jsonl enables tracing to that file
+        // If not set, tracing is disabled
+        let trace_file = std::env::var("SCAFFOLD_TRACE_FILE").ok().filter(|s| !s.is_empty());
         Self {
-            enabled: std::env::var("SCAFFOLD_TRACE").is_ok(),
-            output: TraceOutput::Stderr,
+            enabled: trace_file.is_some(),
+            output: trace_file
+                .map(TraceOutput::File)
+                .unwrap_or(TraceOutput::Stderr),
             include_bodies: true,
             min_level: TraceLevel::Info,
         }
@@ -107,9 +112,9 @@ pub enum TraceEvent {
     LlmCall {
         model: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        prompt: Option<String>,
+        prompt: Option<serde_json::Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        response: Option<String>,
+        response: Option<serde_json::Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         input_tokens: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -390,7 +395,7 @@ mod tests {
     #[test]
     fn test_tracer_disabled_by_default() {
         let tracer = Tracer::new();
-        // Without SCAFFOLD_TRACE env var, tracing should be disabled
+        // Without SCAFFOLD_TRACE_FILE env var, tracing should be disabled
         // (depends on env during test)
     }
 
@@ -426,8 +431,8 @@ mod tests {
             parent_span_id: None,
             event: TraceEvent::LlmCall {
                 model: "gpt-4".to_string(),
-                prompt: Some("Hello".to_string()),
-                response: Some("Hi there!".to_string()),
+                prompt: Some(serde_json::json!({"role": "user", "content": "Hello"})),
+                response: Some(serde_json::json!({"role": "assistant", "content": "Hi there!"})),
                 input_tokens: Some(10),
                 output_tokens: Some(5),
                 error: None,

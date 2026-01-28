@@ -1,0 +1,88 @@
+// Personal Assistant Agent
+// A memory-enabled assistant ported from biraderim to scaffold DSL
+//
+// Usage:
+//   export MEMORY_DIR="./memory"
+//   export OPENAI_API_KEY="sk-..."
+//
+//   scaffold run assistant.scaffold --agent personal_assistant --input '{"message": "Hello", "context": ""}'
+//
+// Test tools:
+//   MEMORY_DIR=./memory scaffold run assistant.scaffold --tool list_files --input '{"directory": ""}'
+//   MEMORY_DIR=./memory scaffold run assistant.scaffold --tool create_file --input '{"filepath": "test.md", "content": "hello"}'
+//   MEMORY_DIR=./memory scaffold run assistant.scaffold --tool read_file --input '{"filepath": "test.md"}'
+
+// ============================================================================
+// File Tools (7 tools matching biraderim's exact behavior)
+// All tools use MEMORY_DIR env var (default: ./memory)
+// ============================================================================
+
+// Read a file from memory
+tool read_file {
+    input: { filepath: string }
+    output: string
+    impl: shell("FP='{filepath}'; MD=$MEMORY_DIR; test -z \"$MD\" && MD=./memory; case \"$FP\" in /*) T=\"$FP\";; *) T=\"$MD/$FP\";; esac; test ! -e \"$T\" && echo \"Error: File '$FP' not found\" && exit 0; test -d \"$T\" && echo \"Error: '$FP' is not a file\" && exit 0; cat \"$T\" 2>/dev/null || echo 'Error reading file'")
+}
+
+// Create a new file (fails if exists)
+tool create_file {
+    input: { filepath: string, content: string }
+    output: string
+    impl: shell("FP='{filepath}'; MD=$MEMORY_DIR; test -z \"$MD\" && MD=./memory; case \"$FP\" in /*) T=\"$FP\";; *) T=\"$MD/$FP\";; esac; test -e \"$T\" && echo \"Error: File '$FP' already exists. Use edit_file to modify it.\" && exit 0; mkdir -p \"$(dirname \"$T\")\"; printf '%s' '{content}' > \"$T\"; echo \"Created '$FP'\"")
+}
+
+// Write/overwrite a file
+tool write_file {
+    input: { filepath: string, content: string }
+    output: string
+    impl: shell("FP='{filepath}'; MD=$MEMORY_DIR; test -z \"$MD\" && MD=./memory; case \"$FP\" in /*) T=\"$FP\";; *) T=\"$MD/$FP\";; esac; mkdir -p \"$(dirname \"$T\")\"; printf '%s' '{content}' > \"$T\"; echo \"Wrote to '$FP'\"")
+}
+
+// Edit a file by replacing exact text (must match exactly once)
+tool edit_file {
+    input: { filepath: string, old_text: string, new_text: string }
+    output: string
+    impl: shell("FP='{filepath}'; MD=$MEMORY_DIR; test -z \"$MD\" && MD=./memory; case \"$FP\" in /*) T=\"$FP\";; *) T=\"$MD/$FP\";; esac; test ! -e \"$T\" && echo \"Error: File '$FP' not found\" && exit 0; COUNT=$(grep -F -c '{old_text}' \"$T\" 2>/dev/null || echo 0); test \"$COUNT\" -eq 0 && echo \"Error: Could not find the text to replace in '$FP'\" && exit 0; test \"$COUNT\" -gt 1 && echo \"Error: Found $COUNT matches. Be more specific with old_text.\" && exit 0; sed -i '' 's/{old_text}/{new_text}/g' \"$T\" 2>/dev/null || sed -i 's/{old_text}/{new_text}/g' \"$T\"; echo \"Edited '$FP'\"")
+}
+
+// Append content to a file
+tool append_file {
+    input: { filepath: string, content: string }
+    output: string
+    impl: shell("FP='{filepath}'; MD=$MEMORY_DIR; test -z \"$MD\" && MD=./memory; case \"$FP\" in /*) T=\"$FP\";; *) T=\"$MD/$FP\";; esac; mkdir -p \"$(dirname \"$T\")\"; EXISTED=0; test -e \"$T\" && EXISTED=1; printf '%s' '{content}' >> \"$T\"; test \"$EXISTED\" -eq 1 && echo \"Appended to '$FP'\" || echo \"Created '$FP'\"")
+}
+
+// Delete a file
+tool delete_file {
+    input: { filepath: string }
+    output: string
+    impl: shell("FP='{filepath}'; MD=$MEMORY_DIR; test -z \"$MD\" && MD=./memory; case \"$FP\" in /*) T=\"$FP\";; *) T=\"$MD/$FP\";; esac; test ! -e \"$T\" && echo \"Error: File '$FP' not found\" && exit 0; test -d \"$T\" && echo \"Error: '$FP' is not a file\" && exit 0; rm \"$T\" && echo \"Deleted '$FP'\"")
+}
+
+// List files in a directory
+tool list_files {
+    input: { directory: string }
+    output: string
+    impl: shell("DIR='{directory}'; MD=$MEMORY_DIR; test -z \"$MD\" && MD=./memory; if test -z \"$DIR\"; then T=\"$MD\"; else case \"$DIR\" in /*) T=\"$DIR\";; *) T=\"$MD/$DIR\";; esac; fi; test ! -e \"$T\" && echo 'Error: Directory not found' && exit 0; test ! -d \"$T\" && echo \"Error: '$DIR' is not a directory\" && exit 0; R=$(ls -1 \"$T\" 2>/dev/null | while read f; do test -d \"$T/$f\" && echo \"[dir]  $f/\" || echo \"[file] $f\"; done | sort); test -z \"$R\" && echo 'Directory is empty' || echo \"$R\"")
+}
+
+// ============================================================================
+// Agent Definition
+// ============================================================================
+
+agent personal_assistant {
+    input: {
+        message: string,
+        context: string
+    }
+    output: { response: string }
+
+    tools: [read_file, create_file, write_file, edit_file,
+            append_file, delete_file, list_files]
+
+    system: file("prompts/assistant.md")
+    max_turns: 10
+    done: response != ""
+    on_error: retry(3)
+    timeout: 120
+}

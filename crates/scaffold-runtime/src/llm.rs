@@ -36,6 +36,156 @@ use crate::error::{Error, Result};
 use rig::client::{CompletionClient, ProviderClient};
 use rig::completion::{AssistantContent, CompletionModel};
 use rig::providers::{anthropic, openai};
+use serde::{Deserialize, Serialize};
+
+// ============================================================================
+// OpenAI-compatible Chat Types (for native tool calling)
+// ============================================================================
+
+/// A chat message in OpenAI format
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: ChatRole,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl ChatMessage {
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::System,
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::User,
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::Assistant,
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    pub fn assistant_with_tool_calls(tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: ChatRole::Assistant,
+            content: None,
+            tool_calls: Some(tool_calls),
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::Tool,
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.into()),
+            name: None,
+        }
+    }
+}
+
+/// Chat message role
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatRole {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+/// A tool call requested by the assistant
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub function: FunctionCall,
+}
+
+/// The function being called
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: String, // JSON string
+}
+
+/// Tool definition for the API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatToolDefinition {
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: FunctionDef,
+}
+
+impl ChatToolDefinition {
+    pub fn new(name: impl Into<String>, description: impl Into<String>, parameters: serde_json::Value) -> Self {
+        Self {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: name.into(),
+                description: description.into(),
+                parameters,
+            },
+        }
+    }
+}
+
+/// Function definition within a tool
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+/// Response from chat completion with tools
+#[derive(Debug, Clone)]
+pub struct ChatResponse {
+    pub message: ChatMessage,
+    pub finish_reason: Option<String>,
+}
+
+impl ChatResponse {
+    /// Check if the response contains tool calls
+    pub fn has_tool_calls(&self) -> bool {
+        self.message.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty())
+    }
+
+    /// Get the tool calls if any
+    pub fn tool_calls(&self) -> Option<&[ToolCall]> {
+        self.message.tool_calls.as_deref()
+    }
+
+    /// Get the content if any
+    pub fn content(&self) -> Option<&str> {
+        self.message.content.as_deref()
+    }
+}
 
 /// Configuration for LLM calls
 #[derive(Debug, Clone, Default)]
@@ -402,6 +552,190 @@ impl Agent {
     pub fn system_prompt(&self) -> Option<&str> {
         self.config.system_prompt.as_deref()
     }
+}
+
+// ============================================================================
+// Chat Completions with Native Tool Calling
+// ============================================================================
+
+/// Make a chat completion request with tool calling support
+///
+/// This function calls the OpenAI-compatible chat completions API directly,
+/// supporting native tool calling without text markers.
+pub async fn chat_with_tools(
+    messages: &[ChatMessage],
+    tools: &[ChatToolDefinition],
+) -> Result<ChatResponse> {
+    let model = &config().default_model;
+    chat_with_tools_and_model(model, messages, tools).await
+}
+
+/// Make a chat completion request with a specific model
+pub async fn chat_with_tools_and_model(
+    model: &str,
+    messages: &[ChatMessage],
+    tools: &[ChatToolDefinition],
+) -> Result<ChatResponse> {
+    // Check for mock mode
+    if std::env::var("SCAFFOLD_LLM_MOCK").is_ok() {
+        return Ok(ChatResponse {
+            message: ChatMessage::assistant("Mock response"),
+            finish_reason: Some("stop".to_string()),
+        });
+    }
+
+    let cfg = config();
+    let (provider, model_name) = parse_model_id(model);
+
+    // If a custom OpenAI base URL is set, assume OpenAI-compatible API
+    // This allows using proxies (LiteLLM, OpenRouter, etc.) for any model
+    let has_custom_base_url = cfg
+        .get_base_url("openai")
+        .map(|url| url != "https://api.openai.com/v1")
+        .unwrap_or(false);
+
+    // When using a proxy (custom base URL), pass the original model string
+    // When using direct OpenAI, pass just the model name
+    let effective_model = if has_custom_base_url { model } else { model_name };
+
+    match provider {
+        "openai" => chat_openai(effective_model, messages, tools, cfg).await,
+        "anthropic" if has_custom_base_url => {
+            // Custom base URL set - assume OpenAI-compatible proxy
+            chat_openai(model, messages, tools, cfg).await
+        }
+        "anthropic" => {
+            Err(Error::ConfigError(
+                "Native tool calling not yet supported for Anthropic. Use OpenAI-compatible proxy with custom base_url, or use 'openai/model-name' prefix."
+                    .to_string(),
+            ))
+        }
+        _ if has_custom_base_url => {
+            // Unknown provider but custom base URL - try OpenAI-compatible
+            chat_openai(model, messages, tools, cfg).await
+        }
+        other => Err(Error::ConfigError(format!(
+            "Unknown LLM provider: {}. Supported: openai (or use custom base_url for compatible APIs)",
+            other
+        ))),
+    }
+}
+
+/// OpenAI chat completions with tools
+async fn chat_openai(
+    model: &str,
+    messages: &[ChatMessage],
+    tools: &[ChatToolDefinition],
+    cfg: &crate::config::Config,
+) -> Result<ChatResponse> {
+    let api_key = cfg.get_api_key("openai").ok_or_else(|| {
+        Error::ConfigError(
+            "OpenAI API key not found. Set OPENAI_API_KEY env var or add to ~/.scaffold/config.toml"
+                .to_string(),
+        )
+    })?;
+
+    let base_url = cfg
+        .get_base_url("openai")
+        .unwrap_or("https://api.openai.com/v1");
+
+    // Build request body
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+    });
+
+    // Add tools if any
+    if !tools.is_empty() {
+        body["tools"] = serde_json::to_value(tools)
+            .map_err(|e| Error::Runtime(format!("Failed to serialize tools: {}", e)))?;
+    }
+
+    // Make HTTP request with timeout
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| Error::Runtime(format!("Failed to create HTTP client: {}", e)))?;
+    let response = client
+        .post(format!("{}/chat/completions", base_url))
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| Error::Runtime(format!("HTTP request failed: {}", e)))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        return Err(Error::Runtime(format!(
+            "OpenAI API error: {} - {}",
+            status, text
+        )));
+    }
+
+    // Parse response
+    let response_json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| Error::Runtime(format!("Failed to parse response: {}", e)))?;
+
+    // Extract the first choice
+    let choice = response_json["choices"]
+        .get(0)
+        .ok_or_else(|| Error::Runtime("No choices in response".to_string()))?;
+
+    let finish_reason = choice["finish_reason"].as_str().map(String::from);
+
+    // Parse the message
+    let msg = &choice["message"];
+    let role = match msg["role"].as_str() {
+        Some("assistant") => ChatRole::Assistant,
+        Some("system") => ChatRole::System,
+        Some("user") => ChatRole::User,
+        Some("tool") => ChatRole::Tool,
+        _ => ChatRole::Assistant,
+    };
+
+    let content = msg["content"].as_str().map(String::from);
+
+    // Parse tool calls if present
+    let tool_calls = if let Some(tc_array) = msg["tool_calls"].as_array() {
+        let calls: Vec<ToolCall> = tc_array
+            .iter()
+            .filter_map(|tc| {
+                Some(ToolCall {
+                    id: tc["id"].as_str()?.to_string(),
+                    call_type: tc["type"].as_str().unwrap_or("function").to_string(),
+                    function: FunctionCall {
+                        name: tc["function"]["name"].as_str()?.to_string(),
+                        arguments: tc["function"]["arguments"].as_str()?.to_string(),
+                    },
+                })
+            })
+            .collect();
+        if calls.is_empty() {
+            None
+        } else {
+            Some(calls)
+        }
+    } else {
+        None
+    };
+
+    Ok(ChatResponse {
+        message: ChatMessage {
+            role,
+            content,
+            tool_calls,
+            tool_call_id: None,
+            name: None,
+        },
+        finish_reason,
+    })
 }
 
 #[cfg(test)]

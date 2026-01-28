@@ -8,6 +8,7 @@ use scaffold_ir::{
     AgentIR, ExprIR, LiteralIR, PipelineCallIR, PipelineIR, PromptIR, StringOrFileIR, ToolExprIR,
     ToolIR, ToolImplIR, TypeDefIR, TypeIR,
 };
+use scaffold_runtime::trace::{tracer, TraceEvent};
 use scaffold_runtime::{PromptManager, Value};
 use std::collections::HashMap;
 use std::future::Future;
@@ -168,6 +169,40 @@ impl ToolExecutor {
         }
     }
 
+    /// Generate example JSON from TypeIR (for prompts)
+    fn generate_example_json(&self, ty: &TypeIR) -> String {
+        match ty {
+            TypeIR::Bool => "true".to_string(),
+            TypeIR::Int => "42".to_string(),
+            TypeIR::Float => "3.14".to_string(),
+            TypeIR::String => "\"your text here\"".to_string(),
+            TypeIR::Any => "null".to_string(),
+            TypeIR::Bytes => "\"base64data\"".to_string(),
+            TypeIR::List { element } => {
+                format!("[{}]", self.generate_example_json(element))
+            }
+            TypeIR::Map { key: _, value } => {
+                format!("{{\"key\": {}}}", self.generate_example_json(value))
+            }
+            TypeIR::Option { inner } => self.generate_example_json(inner),
+            TypeIR::Result { ok, .. } => self.generate_example_json(ok),
+            TypeIR::Struct { fields } => {
+                let field_strs: Vec<String> = fields
+                    .iter()
+                    .map(|(k, v)| format!("\"{}\": {}", k, self.generate_example_json(v)))
+                    .collect();
+                format!("{{{}}}", field_strs.join(", "))
+            }
+            TypeIR::Named { name } => {
+                if let Some(type_def) = self.types.get(name) {
+                    self.generate_example_json(&type_def.definition)
+                } else {
+                    "{}".to_string()
+                }
+            }
+        }
+    }
+
     /// Generate JSON schema from TypeIR
     fn type_to_json_schema(&self, ty: &TypeIR) -> String {
         match ty {
@@ -203,6 +238,9 @@ impl ToolExecutor {
         input: Value,
         prompts: &PromptManager,
     ) -> Result<Value> {
+        let start = std::time::Instant::now();
+        let input_json = serde_json::to_value(&input).ok();
+
         // Check preconditions if spec exists
         if let Some(ref spec) = tool.spec {
             for pre in &spec.preconditions {
@@ -241,6 +279,20 @@ impl ToolExecutor {
                     return Err(InterpreterError::PostconditionFailed(format!("{:?}", post)));
                 }
             }
+        }
+
+        // Trace tool execution
+        if tracer().is_enabled() {
+            tracer().record_completed(
+                &format!("tool-{}", tool.name),
+                TraceEvent::ToolCall {
+                    tool_name: tool.name.clone(),
+                    input: input_json,
+                    output: serde_json::to_value(&result).ok(),
+                    error: None,
+                },
+                start.elapsed(),
+            );
         }
 
         Ok(result)
@@ -286,48 +338,51 @@ impl ToolExecutor {
         Ok(result)
     }
 
-    /// Execute an agent with the given input
+    /// Execute an agent with the given input using native tool calling
     pub async fn execute_agent(
         &mut self,
         agent: &AgentIR,
         input: Value,
         prompts: &PromptManager,
     ) -> Result<Value> {
+        use scaffold_runtime::{chat_with_tools, ChatMessage, ChatToolDefinition};
+
         // Resolve system prompt
         let system = self.resolve_string_or_file(&agent.system)?;
 
-        let max_turns = agent.max_turns.unwrap_or(10);
-        let mut turn = 0;
-        let mut conversation_history = Vec::new();
+        // Build system message with output format instructions
+        let example_json = self.generate_example_json(&agent.output);
+        let system_content = format!(
+            "{}\n\n## Output Format\n\nWhen you are done and ready to respond to the user, you MUST output ONLY valid JSON matching this exact structure:\n\n{}\n\nDo NOT include any text before or after the JSON. Do NOT wrap it in markdown code blocks.",
+            system, example_json
+        );
 
-        // Add initial user input to history
-        let input_str =
-            serde_json::to_string_pretty(&input).unwrap_or_else(|_| format!("{:?}", input));
-        conversation_history.push(format!("User input: {}", input_str));
-
-        // Build tool descriptions for the system prompt
-        let tool_descriptions: Vec<String> = agent
+        // Build tool definitions for native tool calling
+        let tool_defs: Vec<ChatToolDefinition> = agent
             .tools
             .iter()
             .filter_map(|tool_name| {
                 self.tools.get(tool_name).map(|tool| {
-                    let input_schema = self.type_to_json_schema(&tool.input);
-                    let output_schema = self.type_to_json_schema(&tool.output);
-                    format!(
-                        "- {}: input={}, output={}",
-                        tool.name, input_schema, output_schema
+                    let params = self.type_to_json_schema_value(&tool.input);
+                    ChatToolDefinition::new(
+                        &tool.name,
+                        format!("Execute the {} tool", tool.name),
+                        params,
                     )
                 })
             })
             .collect();
 
-        let tools_prompt = if tool_descriptions.is_empty() {
-            String::new()
-        } else {
-            format!("\n\nAvailable tools:\n{}\n\nTo call a tool, respond with: TOOL_CALL: tool_name({{\"arg\": \"value\"}})\nTo finish, respond with: DONE: {{your final answer as JSON}}", tool_descriptions.join("\n"))
-        };
+        // Initialize messages with system and user input
+        let input_str =
+            serde_json::to_string_pretty(&input).unwrap_or_else(|_| format!("{:?}", input));
+        let mut messages = vec![
+            ChatMessage::system(&system_content),
+            ChatMessage::user(format!("Input: {}", input_str)),
+        ];
 
-        let output_schema = self.type_to_json_schema(&agent.output);
+        let max_turns = agent.max_turns.unwrap_or(10);
+        let mut turn = 0;
 
         loop {
             if turn >= max_turns {
@@ -338,86 +393,132 @@ impl ToolExecutor {
             }
             turn += 1;
 
-            // Build prompt for this turn
-            let history_str = conversation_history.join("\n\n");
-            let turn_prompt = format!(
-                "{}{}\n\nExpected output format: {}\n\nConversation so far:\n{}\n\nWhat would you like to do next?",
-                system, tools_prompt, output_schema, history_str
-            );
-
-            // Query LLM
-            let response = scaffold_runtime::llm_query(&turn_prompt)
+            // Make chat completion request with tools
+            let llm_start = std::time::Instant::now();
+            let response = chat_with_tools(&messages, &tool_defs)
                 .await
                 .map_err(|e| InterpreterError::LlmError(e.to_string()))?;
 
-            // Parse response for tool calls or done signal
-            if response.contains("DONE:") {
-                // Extract final answer
-                if let Some(done_idx) = response.find("DONE:") {
-                    let json_str = response[done_idx + 5..].trim();
-                    // Try to extract JSON from the response
-                    let json_str = extract_json(json_str);
-                    let json_value: serde_json::Value =
-                        serde_json::from_str(json_str).map_err(|e| {
-                            InterpreterError::Runtime(format!(
-                                "Failed to parse agent final answer as JSON: {}. Response was: {}",
-                                e, json_str
-                            ))
-                        })?;
-                    return Ok(json_to_value(json_value));
-                }
-            } else if response.contains("TOOL_CALL:") {
-                // Extract and execute tool call
-                if let Some(call_idx) = response.find("TOOL_CALL:") {
-                    let call_str = response[call_idx + 10..].trim();
+            // Trace the LLM call with messages
+            if tracer().is_enabled() {
+                let model_name = scaffold_runtime::config().default_model.clone();
+                tracer().record_completed(
+                    &format!("llm-{}-turn{}", agent.name, turn),
+                    TraceEvent::LlmCall {
+                        model: model_name,
+                        prompt: serde_json::to_value(&messages).ok(),
+                        response: serde_json::to_value(&response.message).ok(),
+                        input_tokens: None,
+                        output_tokens: None,
+                        error: None,
+                    },
+                    llm_start.elapsed(),
+                );
+            }
 
-                    // Parse tool name and args: tool_name({"arg": "value"})
-                    if let Some(paren_idx) = call_str.find('(') {
-                        let tool_name = call_str[..paren_idx].trim();
-                        let args_str = &call_str[paren_idx..];
+            // Check if response has tool calls
+            if response.has_tool_calls() {
+                // Add assistant message with tool calls to history
+                messages.push(response.message.clone());
 
-                        // Find matching closing paren
-                        let args_json = if args_str.starts_with('(') && args_str.contains(')') {
-                            let end_idx = args_str.rfind(')').unwrap_or(args_str.len());
-                            &args_str[1..end_idx]
-                        } else {
-                            "{}"
-                        };
+                // Execute each tool call
+                for tool_call in response.tool_calls().unwrap_or(&[]) {
+                    let tool_name = &tool_call.function.name;
+                    let args_json = &tool_call.function.arguments;
 
-                        // Parse args
-                        let args_value: serde_json::Value = serde_json::from_str(args_json)
-                            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-                        let args = json_to_value(args_value);
+                    // Parse arguments
+                    let args_value: serde_json::Value = serde_json::from_str(args_json)
+                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                    let args = json_to_value(args_value);
 
-                        // Execute tool
-                        if let Some(tool) = self.tools.get(tool_name).cloned() {
-                            match self.execute(&tool, args, prompts).await {
-                                Ok(result) => {
-                                    let result_str = serde_json::to_string_pretty(&result)
-                                        .unwrap_or_else(|_| format!("{:?}", result));
-                                    conversation_history.push(format!(
-                                        "Assistant: TOOL_CALL: {}({})\n\nTool result: {}",
-                                        tool_name, args_json, result_str
-                                    ));
-                                }
-                                Err(e) => {
-                                    conversation_history.push(format!(
-                                        "Assistant: TOOL_CALL: {}({})\n\nTool error: {}",
-                                        tool_name, args_json, e
-                                    ));
-                                }
+                    // Execute tool
+                    let result_content = if let Some(tool) = self.tools.get(tool_name).cloned() {
+                        match self.execute(&tool, args, prompts).await {
+                            Ok(result) => {
+                                serde_json::to_string_pretty(&result)
+                                    .unwrap_or_else(|_| format!("{:?}", result))
                             }
-                        } else {
-                            conversation_history.push(format!(
-                                "Assistant: TOOL_CALL: {}({})\n\nError: Tool '{}' not found",
-                                tool_name, args_json, tool_name
-                            ));
+                            Err(e) => format!("Error: {}", e),
                         }
-                    }
+                    } else {
+                        format!("Error: Tool '{}' not found", tool_name)
+                    };
+
+                    // Add tool result message
+                    messages.push(ChatMessage::tool_result(&tool_call.id, result_content));
                 }
+            } else if let Some(content) = response.content() {
+                // No tool calls - this should be the final response
+                // Try to parse as JSON matching our output schema
+                let json_str = extract_json(content);
+                let json_value: serde_json::Value =
+                    serde_json::from_str(json_str).map_err(|e| {
+                        InterpreterError::Runtime(format!(
+                            "Failed to parse agent response as JSON: {}. Response was: {}",
+                            e, content
+                        ))
+                    })?;
+                return Ok(json_to_value(json_value));
             } else {
-                // Regular response - add to history
-                conversation_history.push(format!("Assistant: {}", response));
+                // Empty response - continue or error
+                return Err(InterpreterError::Runtime(
+                    "Agent returned empty response".to_string(),
+                ));
+            }
+        }
+    }
+
+    /// Convert TypeIR to JSON schema as serde_json::Value (for tool definitions)
+    fn type_to_json_schema_value(&self, ty: &TypeIR) -> serde_json::Value {
+        match ty {
+            TypeIR::Bool => serde_json::json!({"type": "boolean"}),
+            TypeIR::Int => serde_json::json!({"type": "integer"}),
+            TypeIR::Float => serde_json::json!({"type": "number"}),
+            TypeIR::String => serde_json::json!({"type": "string"}),
+            TypeIR::Bytes => serde_json::json!({"type": "string", "format": "byte"}),
+            TypeIR::Any => serde_json::json!({}),
+            TypeIR::List { element } => {
+                serde_json::json!({
+                    "type": "array",
+                    "items": self.type_to_json_schema_value(element)
+                })
+            }
+            TypeIR::Map { key: _, value } => {
+                serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": self.type_to_json_schema_value(value)
+                })
+            }
+            TypeIR::Option { inner } => {
+                // Nullable type
+                let inner_schema = self.type_to_json_schema_value(inner);
+                if let serde_json::Value::Object(mut obj) = inner_schema {
+                    obj.insert("nullable".to_string(), serde_json::json!(true));
+                    serde_json::Value::Object(obj)
+                } else {
+                    inner_schema
+                }
+            }
+            TypeIR::Result { ok, err: _ } => self.type_to_json_schema_value(ok),
+            TypeIR::Struct { fields } => {
+                let properties: serde_json::Map<String, serde_json::Value> = fields
+                    .iter()
+                    .map(|(k, v)| (k.clone(), self.type_to_json_schema_value(v)))
+                    .collect();
+                let required: Vec<String> = fields.keys().cloned().collect();
+                serde_json::json!({
+                    "type": "object",
+                    "properties": properties,
+                    "required": required
+                })
+            }
+            TypeIR::Named { name } => {
+                // Try to resolve from type definitions
+                if let Some(type_def) = self.types.get(name) {
+                    self.type_to_json_schema_value(&type_def.definition)
+                } else {
+                    serde_json::json!({"type": "object"})
+                }
             }
         }
     }
