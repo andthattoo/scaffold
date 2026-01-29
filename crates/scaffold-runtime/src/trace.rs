@@ -8,8 +8,11 @@
 //!
 //! # Usage
 //!
-//! Enable tracing by setting `SCAFFOLD_TRACE_FILE=/path/to/traces.jsonl`.
-//! Traces are emitted as JSONL to the specified file.
+//! Enable tracing by setting one of:
+//! - `SCAFFOLD_TRACE_FILE=/path/to/traces.jsonl` - write traces to a file
+//! - `SCAFFOLD_TRACE_STDERR=1` - write traces to stderr
+//!
+//! Traces are emitted as JSONL.
 //!
 //! ```ignore
 //! use scaffold_runtime::trace::{Tracer, TraceEvent};
@@ -51,13 +54,22 @@ pub struct TracerConfig {
 impl Default for TracerConfig {
     fn default() -> Self {
         // SCAFFOLD_TRACE_FILE=/path/to/file.jsonl enables tracing to that file
-        // If not set, tracing is disabled
+        // SCAFFOLD_TRACE_STDERR=1 enables tracing to stderr (original behavior)
+        // If neither is set, tracing is disabled
         let trace_file = std::env::var("SCAFFOLD_TRACE_FILE").ok().filter(|s| !s.is_empty());
+        let trace_stderr = std::env::var("SCAFFOLD_TRACE_STDERR").ok().filter(|s| !s.is_empty());
+
+        let (enabled, output) = if let Some(file_path) = trace_file {
+            (true, TraceOutput::File(file_path))
+        } else if trace_stderr.is_some() {
+            (true, TraceOutput::Stderr)
+        } else {
+            (false, TraceOutput::Stderr)
+        };
+
         Self {
-            enabled: trace_file.is_some(),
-            output: trace_file
-                .map(TraceOutput::File)
-                .unwrap_or(TraceOutput::Stderr),
+            enabled,
+            output,
             include_bodies: true,
             min_level: TraceLevel::Info,
         }

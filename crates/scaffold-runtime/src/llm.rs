@@ -704,19 +704,42 @@ async fn chat_openai(
 
     // Parse tool calls if present
     let tool_calls = if let Some(tc_array) = msg["tool_calls"].as_array() {
-        let calls: Vec<ToolCall> = tc_array
-            .iter()
-            .filter_map(|tc| {
-                Some(ToolCall {
-                    id: tc["id"].as_str()?.to_string(),
-                    call_type: tc["type"].as_str().unwrap_or("function").to_string(),
-                    function: FunctionCall {
-                        name: tc["function"]["name"].as_str()?.to_string(),
-                        arguments: tc["function"]["arguments"].as_str()?.to_string(),
-                    },
-                })
-            })
-            .collect();
+        let mut calls: Vec<ToolCall> = Vec::new();
+
+        for (i, tc) in tc_array.iter().enumerate() {
+            let id = tc["id"].as_str().ok_or_else(|| {
+                Error::ParseError(format!(
+                    "Tool call {} missing required 'id' field. Raw: {}",
+                    i, tc
+                ))
+            })?;
+
+            let call_type = tc["type"].as_str().unwrap_or("function").to_string();
+
+            let function_name = tc["function"]["name"].as_str().ok_or_else(|| {
+                Error::ParseError(format!(
+                    "Tool call {} missing required 'function.name' field. Raw: {}",
+                    i, tc
+                ))
+            })?;
+
+            let function_arguments = tc["function"]["arguments"].as_str().ok_or_else(|| {
+                Error::ParseError(format!(
+                    "Tool call {} missing required 'function.arguments' field. Raw: {}",
+                    i, tc
+                ))
+            })?;
+
+            calls.push(ToolCall {
+                id: id.to_string(),
+                call_type,
+                function: FunctionCall {
+                    name: function_name.to_string(),
+                    arguments: function_arguments.to_string(),
+                },
+            });
+        }
+
         if calls.is_empty() {
             None
         } else {

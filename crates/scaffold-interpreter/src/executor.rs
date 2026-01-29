@@ -426,9 +426,14 @@ impl ToolExecutor {
                     let tool_name = &tool_call.function.name;
                     let args_json = &tool_call.function.arguments;
 
-                    // Parse arguments
-                    let args_value: serde_json::Value = serde_json::from_str(args_json)
-                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                    // Parse arguments - fail if LLM provided malformed JSON
+                    let args_value: serde_json::Value =
+                        serde_json::from_str(args_json).map_err(|e| {
+                            InterpreterError::Runtime(format!(
+                                "Failed to parse tool '{}' arguments as JSON: {}. Raw arguments: {}",
+                                tool_name, e, args_json
+                            ))
+                        })?;
                     let args = json_to_value(args_value);
 
                     // Execute tool
@@ -449,8 +454,15 @@ impl ToolExecutor {
                 }
             } else if let Some(content) = response.content() {
                 // No tool calls - this should be the final response
+                // Check if content is empty (LLM can return empty string with tool_calls)
+                let trimmed = content.trim();
+                if trimmed.is_empty() {
+                    return Err(InterpreterError::Runtime(
+                        "Agent returned empty response".to_string(),
+                    ));
+                }
                 // Try to parse as JSON matching our output schema
-                let json_str = extract_json(content);
+                let json_str = extract_json(trimmed);
                 let json_value: serde_json::Value =
                     serde_json::from_str(json_str).map_err(|e| {
                         InterpreterError::Runtime(format!(
@@ -490,13 +502,49 @@ impl ToolExecutor {
                 })
             }
             TypeIR::Option { inner } => {
-                // Nullable type
+                // Represent Option<T> as a union with null using standard JSON Schema
                 let inner_schema = self.type_to_json_schema_value(inner);
-                if let serde_json::Value::Object(mut obj) = inner_schema {
-                    obj.insert("nullable".to_string(), serde_json::json!(true));
-                    serde_json::Value::Object(obj)
-                } else {
-                    inner_schema
+                match inner_schema {
+                    serde_json::Value::Object(mut obj) => {
+                        match obj.get("type").cloned() {
+                            Some(serde_json::Value::String(t)) => {
+                                // Convert "type": "T" to "type": ["null", "T"]
+                                let types = serde_json::Value::Array(vec![
+                                    serde_json::Value::String("null".to_string()),
+                                    serde_json::Value::String(t),
+                                ]);
+                                obj.insert("type".to_string(), types);
+                                serde_json::Value::Object(obj)
+                            }
+                            Some(serde_json::Value::Array(mut arr)) => {
+                                // Ensure "null" is included in an existing type array
+                                let null_val = serde_json::Value::String("null".to_string());
+                                if !arr.contains(&null_val) {
+                                    arr.insert(0, null_val);
+                                    obj.insert("type".to_string(), serde_json::Value::Array(arr));
+                                }
+                                serde_json::Value::Object(obj)
+                            }
+                            _ => {
+                                // Fallback: wrap the entire schema in an anyOf with null
+                                serde_json::json!({
+                                    "anyOf": [
+                                        { "type": "null" },
+                                        serde_json::Value::Object(obj)
+                                    ]
+                                })
+                            }
+                        }
+                    }
+                    other => {
+                        // Non-object schemas: wrap in an anyOf with null
+                        serde_json::json!({
+                            "anyOf": [
+                                { "type": "null" },
+                                other
+                            ]
+                        })
+                    }
                 }
             }
             TypeIR::Result { ok, err: _ } => self.type_to_json_schema_value(ok),
@@ -505,7 +553,12 @@ impl ToolExecutor {
                     .iter()
                     .map(|(k, v)| (k.clone(), self.type_to_json_schema_value(v)))
                     .collect();
-                let required: Vec<String> = fields.keys().cloned().collect();
+                // Only include non-Option fields in required array
+                let required: Vec<String> = fields
+                    .iter()
+                    .filter(|(_, v)| !matches!(v, TypeIR::Option { .. }))
+                    .map(|(k, _)| k.clone())
+                    .collect();
                 serde_json::json!({
                     "type": "object",
                     "properties": properties,
